@@ -7,6 +7,7 @@
   sheets  <视频> --segments J --work DIR     每个回合开头/结尾各拼一张帧图，给人或模型核对
   cut     <视频> --segments J --out DIR      按回合剪成独立 mp4，写片段清单
   align   <旧视频> <新视频>                  用声音算两版视频的时间偏移（换高清原片时用）
+  auto    <视频...> [--out DIR]              一条命令跑完：查画质→找回合→自动修结尾→剪→验收，只打印简短汇报
 """
 import argparse, json, os, subprocess, sys, wave
 import numpy as np
@@ -124,6 +125,92 @@ def cmd_analyze(a):
             print(f"{i:2d}  {s['start']:7.1f} -> {s['end']:7.1f}  {s['end'] - s['start']:5.1f}s  击球声{s['hits']}")
 
 
+def trim_video_tail(segs, onsets, dur, gap=3.0, near=2.0, min_hits=6, post=1.5):
+    """视频最后一段若一直响到片尾，从第一个 >gap 秒的空档起，多半是捡球、走过来拿手机的声音，剪掉。"""
+    if not segs or dur - segs[-1]["end"] > near:
+        return segs, None
+    s = segs[-1]
+    h = [t for t in onsets if s["first_hit"] <= t <= s["last_hit"]]
+    cut = next((i for i in range(1, len(h)) if h[i] - h[i - 1] > gap), None)
+    if cut is None:
+        return segs, None
+    keep = h[:cut]
+    if len(keep) < min_hits:
+        return segs[:-1], f"最后一段（{mmss(s['start'])} 起）一直响到片尾、像是收手机，已整段去掉"
+    s2 = dict(s, end=round(keep[-1] + post, 2), hits=len(keep), last_hit=round(keep[-1], 2))
+    return segs[:-1] + [s2], f"最后一段结尾从 {mmss(s['end'])} 提前到 {mmss(s2['end'])}，去掉了片尾收手机的声音"
+
+
+def doubtful(seg, onsets):
+    h = np.array([t for t in onsets if seg["first_hit"] <= t <= seg["last_hit"]])
+    if len(h) < 3:
+        return True
+    return float(np.median(np.diff(h))) > 1.3 or seg["hits"] < 10
+
+
+def cmd_auto(a):
+    import shutil, tempfile
+    work = a.work or tempfile.mkdtemp(prefix="rally_")
+    os.makedirs(work, exist_ok=True)
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.videos[0])), "剪辑")
+    if os.path.isdir(out) and os.listdir(out) and not a.dry_run:
+        bak = out + "_旧版"; n = 2
+        while os.path.exists(bak):
+            bak = f"{out}_旧版{n}"; n += 1
+        os.rename(out, bak); print(f"目标目录已有旧成品，已改名为 {bak}")
+    report, total = [], 0
+    for idx, v in enumerate(a.videos):
+        lab = labels[idx]
+        j = ffprobe_json(v)
+        vs = next(s for s in j["streams"] if s["codec_type"] == "video")
+        w, h_ = int(vs["width"]), int(vs["height"]); br = int(j["format"].get("bit_rate", 0))
+        lowq = min(w, h_) < 720 or br < 2_000_000
+        stem = os.path.splitext(os.path.basename(v))[0]
+        x = extract_wav(v, os.path.join(work, stem + ".wav"))
+        t, dur = onsets(x, k=a.k)
+        segs = group(t, dur, a.gap, a.min_hits, a.pre, a.post)
+        segs, note = trim_video_tail(segs, list(t), dur, post=a.post)
+        json.dump({"video": os.path.abspath(v), "duration": dur, "segments": segs},
+                  open(os.path.join(work, stem + ".segments.json"), "w"), ensure_ascii=False, indent=1)
+        lens = [s["end"] - s["start"] for s in segs]
+        line = f"视频{lab}（{os.path.basename(v)}，{mmss(dur)}，{w}x{h_}）：{len(segs)} 个回合"
+        if lens:
+            line += f"，每段 {min(lens):.0f}~{max(lens):.0f} 秒，共 {sum(lens) / 60:.1f} 分钟（原片 {dur / 60:.1f} 分钟）"
+        report.append(line)
+        if lowq:
+            report.append("  ⚠ 画质像是被聊天软件压缩过，成品会一样糊；有原片的话换原片再跑")
+        if note:
+            report.append("  · " + note)
+        dz = [f"{lab}_{i:02d}" for i, s in enumerate(segs, 1) if doubtful(s, t)]
+        if dz:
+            report.append("  · 击球声偏少或偏稀、建议人眼看一下：" + "、".join(dz))
+        total += len(segs)
+        if a.dry_run:
+            for i, s in enumerate(segs, 1):
+                report.append(f"    {lab}_{i:02d} {s['start']:.1f}->{s['end']:.1f}s 击球声{s['hits']}")
+            continue
+        a2 = argparse.Namespace(video=v, segments=os.path.join(work, stem + ".segments.json"),
+                                out=out, label=lab, crf=a.crf, quiet=True)
+        cmd_cut(a2)
+        bad = []
+        for i, s in enumerate(segs, 1):
+            f = os.path.join(out, f"视频{lab}_{i:02d}_{mmss(s['start'])}-{mmss(s['end'])}.mp4")
+            try:
+                d = float(ffprobe_json(f)["format"]["duration"])
+                if abs(d - (s["end"] - s["start"])) > 0.5:
+                    bad.append(os.path.basename(f))
+            except Exception:
+                bad.append(os.path.basename(f))
+        if bad:
+            report.append("  ✗ 时长不对或打不开：" + "、".join(bad))
+    print("\n".join(report))
+    if not a.dry_run:
+        from urllib.parse import quote
+        print(f"共 {total} 个片段 -> {out}\nFinder 链接: file://{quote(os.path.abspath(out))}/")
+    print(f"中间文件: {work}")
+
+
 def cmd_sheets(a):
     j = json.load(open(a.segments))
     os.makedirs(a.work, exist_ok=True)
@@ -155,8 +242,10 @@ def cmd_cut(a):
                  "-profile:v", "high", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                  "-movflags", "+faststart", os.path.join(a.out, name)])
             f.write(f"{name}  原片 {s['start']}s -> {s['end']}s  时长 {dur}s  击球声 {s['hits']} 次\n")
-            print("done", name, flush=True)
-    print("清单:", lst)
+            if not getattr(a, "quiet", False):
+                print("done", name, flush=True)
+    if not getattr(a, "quiet", False):
+        print("清单:", lst)
 
 
 def env10ms(x):
@@ -191,6 +280,12 @@ def main():
     q.add_argument("--crf", type=int, default=17); q.set_defaults(fn=cmd_cut)
     q = sp.add_parser("align"); q.add_argument("old"); q.add_argument("new"); q.add_argument("--work")
     q.set_defaults(fn=cmd_align)
+    q = sp.add_parser("auto"); q.add_argument("videos", nargs="+"); q.add_argument("--out")
+    q.add_argument("--work"); q.add_argument("--dry-run", action="store_true", help="只算切点不剪")
+    q.add_argument("--k", type=float, default=2.5); q.add_argument("--gap", type=float, default=6.0)
+    q.add_argument("--min-hits", type=int, default=6); q.add_argument("--pre", type=float, default=1.0)
+    q.add_argument("--post", type=float, default=1.5); q.add_argument("--crf", type=int, default=17)
+    q.set_defaults(fn=cmd_auto)
     a = p.parse_args(); a.fn(a)
 
 
